@@ -1,5 +1,7 @@
 """Сбор новостей и афиши: Claude с веб-поиском + прогноз погоды Open-Meteo."""
 import json
+
+import json_repair
 import logging
 import os
 import re
@@ -69,7 +71,8 @@ nice.fr, Métropole Nice Côte d'Azur, Lignes d'Azur, Météo-France, Préfectur
 География: Ницца и окрестности (Антиб, Канны, Монако, Ментон, Вильфранш, Сен-Поль-де-Ванс, Грас и т. п.).
 Пиши по-русски своими словами, коротко, без копирования абзацев из статей. Французские названия мест и событий
 оставляй как есть. Не выдумывай: включай только то, что нашёл в поиске, у каждого пункта — ссылка на источник.
-В конце ответа выдай ТОЛЬКО JSON по схеме ниже, без пояснений до и после."""
+В конце ответа выдай ТОЛЬКО JSON по схеме ниже, без пояснений до и после.
+Внутри текстовых значений JSON никогда не используй двойные кавычки " — для названий бери «ёлочки»."""
 
 NEWS_TASK = """Сегодня {today}. Собери утреннюю сводку новостей за последние сутки (не старше 36 часов).
 Разделы:
@@ -100,10 +103,20 @@ JSON:
 
 def parse_json(text: str) -> dict:
     text = re.sub(r"```(?:json)?", "", text)
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
+    start = text.find("{")
+    if start == -1:
         raise ValueError("В ответе нет JSON")
-    return json.loads(text[start:end + 1])
+    end = text.rfind("}")
+    chunk = text[start:end + 1] if end > start else text[start:]
+    try:
+        return json.loads(chunk)
+    except json.JSONDecodeError as ex:
+        # Claude иногда ставит " внутри названий или обрывает ответ — чиним
+        logging.warning("JSON с ошибкой (%s), чиню", ex)
+        d = json_repair.loads(text[start:])
+        if not isinstance(d, dict):
+            raise ValueError("Не удалось разобрать JSON") from ex
+        return d
 
 
 async def ask(task: str) -> dict:
@@ -111,7 +124,7 @@ async def ask(task: str) -> dict:
     tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": MAX_SEARCHES, "user_location": LOCATION}]
     text = ""
     for _ in range(4):  # поиск может приостановить ход (pause_turn) — продолжаем
-        resp = await client().messages.create(model=MODEL, max_tokens=6000, system=COMMON,
+        resp = await client().messages.create(model=MODEL, max_tokens=10000, system=COMMON,
                                               messages=messages, tools=tools)
         text += "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
         if resp.stop_reason != "pause_turn":
